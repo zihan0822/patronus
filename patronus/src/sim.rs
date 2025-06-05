@@ -3,6 +3,8 @@
 // author: Kevin Laeufer <laeufer@berkeley.edu>
 mod interface;
 mod interpreter;
+mod jit;
 
 pub use interface::Simulator;
 pub use interpreter::Interpreter;
+pub use jit::{JITEngine, JITError};
