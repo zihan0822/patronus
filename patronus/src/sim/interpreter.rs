@@ -103,7 +103,7 @@ impl<'a> Simulator for Interpreter<'a> {
         self.step_count += 1;
     }
 
-    fn set<'b>(&mut self, expr: ExprRef, value: impl Into<BitVecValueRef<'b>>) {
+    fn set<'b>(&mut self, expr: ExprRef, value: BitVecValueRef<'b>) {
         self.data.update_bv(expr, value);
     }
 
@@ -114,11 +114,7 @@ impl<'a> Simulator for Interpreter<'a> {
         Some(eval_bv_expr(self.ctx, &self.data, expr))
     }
 
-    fn get_element<'b>(
-        &self,
-        _expr: ExprRef,
-        _index: impl Into<BitVecValueRef<'b>>,
-    ) -> Option<BitVecValue> {
+    fn get_element<'b>(&self, _expr: ExprRef, _index: BitVecValueRef<'b>) -> Option<BitVecValue> {
         todo!()
     }
 
