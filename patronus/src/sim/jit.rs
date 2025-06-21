@@ -13,6 +13,7 @@ use compiler::*;
 use cranelift::module::ModuleError;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 type JITResult<T> = Result<T, JITError>;
 
@@ -77,19 +78,132 @@ where
 
 const CURRENT_STATE_INDEX: usize = 0;
 const NEXT_STATE_INDEX: usize = 1;
+const PREFETCH_BACKOFF_THRESHOLD: usize = 5;
 
 pub struct JITEngine<'expr> {
     buffers: [Box<[i64]>; 2],
     ctx: &'expr expr::Context,
     sys: &'expr TransitionSystem,
     /// interior mutability for lazy compilation triggered by `Simulator::get`
-    backend: RefCell<JITBackend>,
+    backend: Rc<RefCell<JITBackend>>,
     /// non-init bv states, resources allocated for those states will be reclaimed during every step
     mortal_states: Vec<ExprRef>,
     /// init and array states, resources allocated for those states will only be reclaimed when dropping the JITEngine
     immortal_states: Vec<ExprRef>,
+    prefetch_expr_pool: RefCell<PrefetchExprPool<'expr>>,
     states_to_offset: FxHashMap<ExprRef, usize>,
     step_count: u64,
+}
+
+enum PrefetchStage {
+    Stale,
+    Tracing,
+    Normal,
+    Dormant,
+}
+
+struct PrefetchExprPool<'expr> {
+    backoff_cnt: usize,
+    output_buffer: Vec<i64>,
+    states_to_offset: FxHashMap<ExprRef, usize>,
+    ctx: &'expr expr::Context,
+    backend: Rc<RefCell<JITBackend>>,
+    compiled_batch_eval: Option<EvalBatchedExprWithUpdate>,
+    stage: PrefetchStage,
+}
+
+impl<'expr> PrefetchExprPool<'expr> {
+    fn new(ctx: &'expr expr::Context, backend: Rc<RefCell<JITBackend>>) -> Self {
+        Self {
+            backoff_cnt: 0,
+            output_buffer: vec![],
+            states_to_offset: FxHashMap::default(),
+            ctx,
+            backend,
+            compiled_batch_eval: None,
+            stage: PrefetchStage::Dormant,
+        }
+    }
+
+    fn register_traced_expr(&mut self, expr: ExprRef) {
+        let len = self.states_to_offset.len();
+        self.states_to_offset.entry(expr).or_insert(len);
+    }
+
+    fn prefetch_all(&mut self, input_state_buffer: &dyn StateBufferView<i64>) {
+        let eval_fn = self.compiled_batch_eval.get_or_insert_with(|| {
+            self.output_buffer
+                .resize(self.states_to_offset.len(), 0_i64);
+            for (&state, &offset) in &self.states_to_offset {
+                if let Some(index_width) = state.get_type(self.ctx).get_array_index_width() {
+                    self.output_buffer[offset] =
+                        runtime::__alloc_const_array(index_width, 0) as i64;
+                }
+            }
+            eprintln!("prefetched buffer size: {:?}", self.states_to_offset.len());
+            self.backend
+                .borrow_mut()
+                .compiler
+                .compile_batched_eval_service(
+                    self.ctx,
+                    self.states_to_offset.keys().copied().collect(),
+                    input_state_buffer,
+                    &StateBuffer {
+                        buffer: self.output_buffer.as_mut_slice(),
+                        states_to_offset: &self.states_to_offset,
+                        ctx: self.ctx,
+                    },
+                ).unwrap_or_else(|err| panic!("fail to compile batched eval fn for prefetched non-state exprs, due to {err:?}"))
+        });
+        unsafe {
+            eval_fn.call(
+                input_state_buffer.as_slice(),
+                self.output_buffer.as_mut_slice(),
+            );
+        }
+    }
+
+    fn eval_expr(
+        &mut self,
+        expr: ExprRef,
+        input_state_buffer: &dyn StateBufferView<i64>,
+    ) -> Option<i64> {
+        if matches!(self.stage, PrefetchStage::Stale) {
+            self.prefetch_all(input_state_buffer);
+            self.stage = PrefetchStage::Normal;
+        }
+
+        if matches!(self.stage, PrefetchStage::Normal) {
+            if let Some(&offset) = self.states_to_offset.get(&expr) {
+                return Some(self.output_buffer[offset]);
+            }
+        }
+        match self.stage {
+            PrefetchStage::Normal => self.backoff_cnt += 1,
+            PrefetchStage::Tracing => self.register_traced_expr(expr),
+            _ => {}
+        }
+        if self.backoff_cnt > PREFETCH_BACKOFF_THRESHOLD {
+            self.tear_down()
+        }
+        None
+    }
+
+    fn tear_down(&mut self) {
+        let output_state_buffer = StateBuffer {
+            buffer: self.output_buffer.as_mut_slice(),
+            states_to_offset: &self.states_to_offset,
+            ctx: self.ctx,
+        };
+        // SAFETY: states in the output buffer all points to valid objects and the reclaimed heap resources can not be accessed anywhere else
+        unsafe {
+            output_state_buffer.reclaim_all();
+        }
+        self.stage = PrefetchStage::Dormant;
+        self.backoff_cnt = 0;
+        std::mem::take(&mut self.states_to_offset);
+        self.compiled_batch_eval.take();
+    }
 }
 
 #[derive(Default)]
@@ -209,8 +323,11 @@ impl<'expr> JITEngine<'expr> {
 
         let buffers: [Box<[i64]>; 2] =
             std::array::from_fn(|_| vec![0_i64; states_to_offset.len()].into_boxed_slice());
+        let backend = Rc::default();
+        let prefetch_expr_pool = RefCell::new(PrefetchExprPool::new(ctx, Rc::clone(&backend)));
         let mut engine = Self {
-            backend: RefCell::default(),
+            backend,
+            prefetch_expr_pool,
             mortal_states,
             immortal_states,
             buffers,
@@ -303,6 +420,16 @@ impl<'expr> JITEngine<'expr> {
             for &state in &self.mortal_states {
                 next_state_buffer_mut!(self).reclaim_heap_allocated_expr(state)
             }
+        }
+    }
+
+    fn transit_prefetch_stage(&self) {
+        let mut prefetch_expr_pool = self.prefetch_expr_pool.borrow_mut();
+        let stage = &mut prefetch_expr_pool.stage;
+        match stage {
+            PrefetchStage::Dormant => *stage = PrefetchStage::Tracing,
+            PrefetchStage::Tracing | PrefetchStage::Normal => *stage = PrefetchStage::Stale,
+            _ => {}
         }
     }
 }
@@ -414,6 +541,7 @@ impl Simulator for JITEngine<'_> {
     fn step(&mut self) {
         self.step_transition_sys();
         self.swap_state_buffer();
+        self.transit_prefetch_stage();
         self.step_count += 1;
     }
 
@@ -430,13 +558,25 @@ impl Simulator for JITEngine<'_> {
     }
 
     fn get(&self, expr: ExprRef) -> baa::Value {
-        let mut is_cached_symbol = false;
-        let value = if let Some(&offset) = self.states_to_offset.get(&expr) {
-            is_cached_symbol = true;
-            current_state_buffer!(self).as_slice()[offset]
-        } else {
-            self.eval_expr(expr)
-        };
+        let mut is_cached_symbol = true;
+        // tiered expr getting
+        // 1. expr is one of the symbols kept in current_state_buffer
+        // 2. expr can be found in prefetched non-state expr pool
+        // 3. fallback to normal expr eval routine, evaluated on-the-fly
+        let value = self
+            .states_to_offset
+            .get(&expr)
+            .map(|&offset| current_state_buffer!(self).as_slice()[offset])
+            .or_else(|| {
+                self.prefetch_expr_pool
+                    .borrow_mut()
+                    .eval_expr(expr, &current_state_buffer!(self))
+            })
+            .unwrap_or_else(|| {
+                is_cached_symbol = false;
+                self.eval_expr(expr)
+            });
+
         match expr.get_type(self.ctx) {
             expr::Type::Array(expr::ArrayType { index_width, .. }) => {
                 // SAFETY: jit compiler guarantees that value points to a boxed slice with len 1 << index_width
@@ -452,15 +592,10 @@ impl Simulator for JITEngine<'_> {
             }
             expr::Type::BV(width) => match width {
                 0..=64 => baa::Value::BitVec(BitVecValue::from_u64(value as u64, width)),
-                _ =>
-                // SAFETY: jit compiler guarantees that value is a pointer to wide bv allocated on heap
-                unsafe {
-                    if is_cached_symbol {
-                        baa::Value::BitVec((*(value as *mut BitVecValue)).clone())
-                    } else {
-                        baa::Value::BitVec(*Box::from_raw(value as *mut BitVecValue))
-                    }
-                },
+                _ => {
+                    // XXX: support wide bv in prefetch pool
+                    unreachable!()
+                }
             },
         }
     }

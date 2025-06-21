@@ -59,10 +59,48 @@ impl JITCompiler {
         }
     }
 
+    pub(super) fn compile_batched_eval_service(
+        &mut self,
+        expr_ctx: &expr::Context,
+        expr_batch: Vec<ExprRef>,
+        input_state_buffer: &dyn StateBufferView<i64>,
+        output_state_buffer: &dyn StateBufferView<i64>,
+    ) -> JITResult<EvalBatchedExprWithUpdate> {
+        self.compile_batched_expr_with_update(
+            expr_ctx,
+            expr_batch.iter().map(|&e| (e, e)),
+            input_state_buffer,
+            output_state_buffer,
+        )
+    }
+
     pub(super) fn compile_transition_sys(
         &mut self,
         expr_ctx: &expr::Context,
         sys: &TransitionSystem,
+        input_state_buffer: &dyn StateBufferView<i64>,
+        output_state_buffer: &dyn StateBufferView<i64>,
+    ) -> JITResult<EvalBatchedExprWithUpdate> {
+        let update_rule = sys
+            .states
+            .iter()
+            .filter_map(|state| state.next.map(|next| (state.symbol, next)));
+
+        self.compile_batched_expr_with_update(
+            expr_ctx,
+            update_rule,
+            input_state_buffer,
+            output_state_buffer,
+        )
+    }
+
+    /// `update_rule` can be read as an iterator over (where_to_store_the_result, expr_to_eval)
+    /// Returns a compiled function that evaluates all exprs as a batch and stores the results to
+    /// their corresponding slot in the `output_state_buffer`
+    fn compile_batched_expr_with_update(
+        &mut self,
+        expr_ctx: &expr::Context,
+        update_rule: impl IntoIterator<Item = (ExprRef, ExprRef)>,
         input_state_buffer: &dyn StateBufferView<i64>,
         output_state_buffer: &dyn StateBufferView<i64>,
     ) -> JITResult<EvalBatchedExprWithUpdate> {
@@ -72,20 +110,16 @@ impl JITCompiler {
             call_conv: isa::CallConv::SystemV,
         };
 
-        let (next_expr_batch, states_expr): (Vec<_>, Vec<_>) = sys
-            .states
-            .iter()
-            .filter_map(|state| state.next.map(|next| (next, state.symbol)))
-            .unzip();
+        let (output_indices, expr_batch): (Vec<_>, Vec<_>) = update_rule.into_iter().unzip();
 
         self.enter_compile_ctx_with(
             sig,
             expr_ctx,
-            next_expr_batch,
+            expr_batch,
             input_state_buffer,
-            |batch, mut codegen_ctx| {
-                debug_assert_eq!(states_expr.len(), batch.len());
-                for (expr, ret) in std::iter::zip(states_expr, batch) {
+            |ret_batch, mut codegen_ctx| {
+                debug_assert_eq!(output_indices.len(), ret_batch.len());
+                for (expr, ret) in std::iter::zip(output_indices, ret_batch) {
                     let param_offset = output_state_buffer.get_state_offset(expr) as u32;
                     let output_buffer_address =
                         codegen_ctx.fn_builder.block_params(codegen_ctx.block_id)[1];
